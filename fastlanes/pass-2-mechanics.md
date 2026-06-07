@@ -51,7 +51,7 @@ Real-world hook: a `latency_ms` column where all values are under 32 ms (low-lat
 
 ## Rung 2 — Naive: pack the 32 values back-to-back, decode scalar
 
-Forget SIMD for a moment. Just pack v0, v1, v2, … into a bit-stream, low bits first.
+Forget SIMD for a moment. Think of the bit-stream as a ribbon you write values onto end to end, no gaps. Just pack v0, v1, v2, … onto it, low bits first.
 
 ```
 bit pos:   0   5   10  15  20  25  30  35  40  ...
@@ -102,9 +102,9 @@ slot 3 ← bytes 12..15
 
 v6 sits at bit position 30. Byte 3 holds bits 24..31; byte 4 holds bits 32..39. So v6's bits straddle byte 3 and byte 4 — and those bytes are in **different slots** (slot 0 and slot 1).
 
-**The pain:** to decode v6, slot 0 must read into slot 1's word. Cross-lane shuffle. SIMD's promise dies. This is the Pass 0 picture made concrete.
+**The pain:** to decode v6, slot 0 must reach across and read into slot 1's word. That's a cross-lane shuffle — the one thing SIMD is bad at, because each slot is supposed to mind its own business and never peek at its neighbor. SIMD's promise dies right there. This is the Pass 0 picture made concrete.
 
-**The fix:** rearrange the 32 values so that straddles only happen *inside* one slot's window.
+**The fix:** rearrange the 32 values so that straddles only happen *inside* one slot's window. If a value's bits never cross a slot boundary, no slot ever has to peek at its neighbor.
 
 ---
 
@@ -190,9 +190,9 @@ These are the **actual bytes** that will sit on disk / in RAM. From here, every 
 
 ### Why byte-granular interleave (not word-granular)?
 
-A 4-slot, 32-bit-slot SIMD load takes 16 bytes from memory and routes 4 bytes to each slot. With our interleave, those 4 bytes per slot are byte 0..3 of that slot's stream — perfectly aligned.
+Think of the SIMD load as a dealer dealing one card to each of four players in turn. A 4-slot, 32-bit-slot SIMD load takes 16 bytes from memory and deals 4 bytes to each slot. With our interleave, the four bytes each slot receives are byte 0..3 of that slot's own stream — perfectly aligned.
 
-We could not interleave per-bit: a SIMD load splits by **byte** boundaries, not bits. The smallest granularity the hardware respects is one byte.
+Why not interleave per-bit instead? Because the dealer can only deal whole bytes. A SIMD load splits by **byte** boundaries, not bits — one byte is the smallest unit the hardware will hand out.
 
 ### Pre-empt: "why not 5 bytes per slot per load?"
 
@@ -214,7 +214,7 @@ reg[3] = [ df, ad, 7a, 08 ]
 reg[4] = [ 3a, 74, ae, e0 ]
 ```
 
-5 SIMD byte-loads. After this, each slot independently holds the 5 bytes of its own stream — no inter-slot work needed.
+Five SIMD byte-loads, and that's the whole setup. After this, each slot is holding the 5 bytes of its own stream and nothing else — no slot ever has to reach across to a neighbor again.
 
 Now extract the 8 values per slot. Each iteration `v_idx ∈ 0..8` extracts ONE value per slot (4 values total per iteration).
 
@@ -229,7 +229,7 @@ word  = reg[byte_idx]  |  (reg[byte_idx + 1] << 8)    ← 16-bit window
 value = (word >> bit_idx) & 0b11111
 ```
 
-Crucially, `byte_idx` and `bit_idx` are the **same for all 4 slots** in a given iteration. The SIMD instructions become:
+Here's the trick that makes the whole thing work: `byte_idx` and `bit_idx` are the **same for all 4 slots** in a given iteration. Every slot sits at the same bit position inside its own stream, so they all want the same shift and the same byte index. Compute it once, apply it to all four at once. The SIMD instructions become:
 
 ```
 word   = SIMD-OR( reg[byte_idx],  SIMD-SHL( reg[byte_idx+1], 8) )
@@ -312,13 +312,13 @@ Real-world hook: a `WHERE latency_ms < 32` filter over 1024 such values runs as 
 
 ### The hurt that opens rung 5
 
-We just proved the 4-slot decoder works on these bytes. But the paper's central claim is **interpretability** — *the same bytes* must decode on a 2-slot, 4-slot, 8-slot machine without re-encoding. We have only shown 4-slot. What happens if a different-width CPU reads these bytes?
+We just proved the 4-slot decoder works on these bytes. But the paper's central claim is **interpretability** — *the same bytes* must decode on a 2-slot, 4-slot, 8-slot machine without re-encoding. Write the file once, read it on any CPU. We have only shown 4-slot. So the obvious worry: hand these exact bytes to a different-width CPU and do you still get the right answer back?
 
 ---
 
 ## Rung 5 — Interpretability: 2-slot CPU and 4-slot CPU decode the same bytes
 
-In our 32-value block we used 4 streams. Call this T=4 (number of streams in the layout = 4 virtual lanes). The SIMD width W is whatever the CPU has.
+Don't let the two-letter symbols scare you here — there are only two numbers in play. In our 32-value block we used 4 streams. Call this T=4 (number of streams in the layout = 4 virtual lanes). That's baked into the bytes and never changes. The SIMD width W is whatever the CPU happens to have, and it changes machine to machine. T is fixed by the file; W is fixed by the hardware. Interpretability is the whole question of how those two get along.
 
 - **W = T = 4** → one SIMD load fills all 4 streams' bytes into 4 slots. Eight iterations finish the block.
 - **W = 2** (smaller CPU) → each SIMD load fills 2 streams' bytes into 2 slots. The decoder does **two passes** through the iterations: first pass handles streams 0..1, second pass handles streams 2..3. Sixteen iterations finish the block.

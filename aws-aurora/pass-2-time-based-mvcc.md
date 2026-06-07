@@ -13,7 +13,7 @@ New terms this pass defines inline: **xid**, **xmin/xmax**, **xip_list**, **MVCC
 
 ## Rung 1 — How stock PostgreSQL decides visibility, and the two ways it fails at scale
 
-Before we can appreciate Aurora's timestamp trick, we need the stock-Postgres mechanism it *replaces*, in mechanical detail. This is the rung Pass 0 sketched; here we make it concrete enough to break.
+You can't appreciate Aurora's timestamp trick until you've felt the thing it *replaces* creak under load. So let's build that thing first. Pass 0 sketched it; here we make it concrete enough to break in your hands.
 
 **MVCC** = Multi-Version Concurrency Control: instead of overwriting a row in place, the database keeps multiple *versions* of each row, and each reader is shown the version that was current "as of" its transaction. Readers never block writers and writers never block readers — they just see different versions.
 
@@ -72,11 +72,11 @@ The reader sees value=50 (version A), *not* the 80 written by the still-running 
 
 ### Pain (a): building that set is a contention point
 
-Every time a transaction takes a snapshot it must compute the current set of in-flight xids. That means walking the shared list of active transactions under a lock. At low concurrency this is cheap. At thousands of transactions per second across many cores, that shared structure becomes a measured hot spot — Postgres's `ProcArrayLock` is a well-known scalability bottleneck precisely because snapshotting contends on it. The cost grows with the *number of concurrent transactions*, which is exactly the regime an OLTP scale-out database lives in.
+Think of every reader having to pause at a turnstile and copy down the list of everyone currently inside the building before walking in. Every time a transaction takes a snapshot it must compute the current set of in-flight xids — and that means walking the shared list of active transactions under a lock. At low concurrency this is cheap. Nobody's waiting at the turnstile. But at thousands of transactions per second across many cores, that shared structure turns into a measured hot spot — Postgres's `ProcArrayLock` is a famous scalability bottleneck for exactly this reason. And the cost grows with the *number of concurrent transactions*, which is precisely the regime an OLTP scale-out database lives in. The busier you get, the more it hurts.
 
 ### Pain (b): the set doesn't even *exist* across machines
 
-This is the fatal one for a distributed database. The `xip_list` is the set of transactions in-flight **on one primary**. There is no global counter handing out xids across four independent shards, and no single node that knows the union of all shards' in-flight transactions. You could *build* one — a central xid oracle that every shard consults — but that reintroduces the exact bottleneck and single point of failure the whole architecture exists to escape (Pass 0 Rung 4 named this).
+This is the fatal one for a distributed database. The `xip_list` is the set of transactions in-flight **on one primary**. There is no global counter handing out xids across four independent shards, and no single node that knows the union of all shards' in-flight transactions. Couldn't you just *build* one — a central xid oracle every shard phones for an answer? You could. But now you've reinvented the exact bottleneck and single point of failure the whole architecture exists to escape (Pass 0 Rung 4 named this). You've moved the turnstile, not removed it.
 
 ```
    shard 0 in-flight: {100, 102}      shard 2 in-flight: {77, 90}
@@ -92,7 +92,7 @@ This is the fatal one for a distributed database. The `xip_list` is the set of t
 
 ## Rung 2 — The fix: throw away the set, keep a single scalar timestamp
 
-Here is the move the entire paper pivots on. Replace the three-part `(xmin, xmax, xip_list)` snapshot with **one number**: a timestamp drawn from a physical clock (Amazon Time Sync).
+Here is the move the entire paper pivots on. Instead of copying down the guest list at the turnstile, you glance at the clock on the wall on your way in. That's it. Replace the three-part `(xmin, xmax, xip_list)` snapshot with **one number**: a timestamp drawn from a physical clock (Amazon Time Sync).
 
 Each transaction gets two timestamps:
 
@@ -122,7 +122,7 @@ toy:  reader T has startTs = 100
 
 ### Why a scalar lets each shard decide alone
 
-Re-derive the unlock, because it's the reason the set had to go. A set membership test (`is xid 102 in xip_list?`) needs the *whole set*, which needs global knowledge. A scalar comparison (`60 <= 100?`) needs only the two numbers already in hand:
+It's worth seeing exactly why this unlocks distribution, because it's the whole reason the set had to go. Ask: what does each test actually *need to know*? A set membership test (`is xid 102 in xip_list?`) needs the *whole set* — which means global knowledge. A scalar comparison (`60 <= 100?`) needs only the two numbers already in your hand:
 
 - The reader **carries its `startTs`** to every shard it touches. That's one integer in the request.
 - Each row version on a shard already knows the `commitTs` of its creator (next rung shows how).
@@ -145,11 +145,11 @@ This simultaneously kills **both** pains from Rung 1: no expensive set to build 
 
 ## Rung 3 — Time-based version visibility: same row format, timestamp decision (§5.2)
 
-We just said "each row version knows its creator's `commitTs`." But Rung 1 showed Postgres rows carry `xmin`/`xmax`, which are **xids, not timestamps**. Did Aurora rewrite the on-disk row format? **No** — and seeing why not is this rung.
+We just said "each row version knows its creator's `commitTs`." But Rung 1 showed Postgres rows carry `xmin`/`xmax`, which are **xids, not timestamps**. So did Aurora have to tear up the on-disk row format to make this work? You'd assume so. **No** — and seeing how they dodged it is this rung.
 
 ### The row format is unchanged
 
-A row version still stores `xmin` (creator xid) and `xmax` (superseder xid), exactly as stock Postgres. What changes is the *question asked of those fields at read time*. Aurora needs to turn an xid into a `commitTs`. It does that with a structure Postgres already has.
+A row version still stores `xmin` (creator xid) and `xmax` (superseder xid), exactly as stock Postgres. What changes is the *question asked of those fields at read time*. The row still says "I was made by xid 100"; Aurora just needs to turn that xid into a `commitTs`. And it turns out Postgres already keeps a phone book for exactly that lookup.
 
 ```
    xid → commitTs lookup lives in the COMMIT LOG
@@ -208,7 +208,7 @@ Notice each reader needed only its own `startTs` and the row's two commit timest
 
 ## Rung 4 — Write-conflict detection: Snapshot Isolation, first-committer-wins (§5.3)
 
-Visibility (Rungs 2–3) governs *reads*. It says nothing about two transactions trying to write the *same* row concurrently. If both just stamped a new version, you'd get a **lost update** — one write silently clobbering the other. We need a rule for write conflicts. Here Aurora does **exactly what stock Postgres does** — this rung is mostly "good news, nothing new to learn," but you must see *why* the timestamp scheme doesn't change it.
+Visibility (Rungs 2–3) governs *reads*. It says nothing about two transactions trying to write the *same* row at the same time. Picture two people editing the same line of a shared doc with no merge — whoever saves last just paints over the other. That's a **lost update**, and we need a rule to stop it. Here's the good news: Aurora does **exactly what stock Postgres does**. Nothing new to memorize. But you do need to see *why* the new timestamp scheme leaves this part untouched.
 
 **Snapshot Isolation (SI)** is the isolation level: every transaction reads from its own consistent snapshot (Property 1), and write conflicts are resolved by **first-committer-wins** — if two transactions modify the same row, the one that commits first wins; the other must abort.
 
@@ -259,7 +259,7 @@ T2 must retry with a fresh `startTs` (e.g. 140), at which point it would *see* T
 
 ## Rung 5 — The remaining gap: Property 1 alone doesn't guarantee real-time order (§5.6)
 
-We have a working single-shard MVCC engine. Now the subtle pain that motivates **commit-wait**. This rung needs no second shard — it's about one committing transaction and one later transaction, and the fact that **clocks are intervals, not points.**
+We have a working single-shard MVCC engine. Now for the subtle pain that motivates **commit-wait** — and don't worry, you don't need a second shard or any new machinery to feel it. It's just one committing transaction, one later transaction, and a single uncomfortable fact: **a clock doesn't tell you a point in time, it tells you an interval.** The true moment is somewhere inside, you just don't know where.
 
 ### The gap
 
@@ -281,7 +281,7 @@ That violates the intuition any application relies on: *if I committed a write, 
 
 ### The mechanism: commit-wait (Spanner-style)
 
-The fix is to make `commitTs` *true*: don't let a transaction claim it committed at time `commitTs` until the **real time has provably passed `commitTs` everywhere**. Concretely, after picking `commitTs`, the committer does **not acknowledge the client** until:
+The fix is almost stubbornly simple: make `commitTs` *honest*. Don't let a transaction tell the client "I committed at time `commitTs`" until the **real time has provably passed `commitTs` everywhere** — wait out the lie until it becomes true. Concretely, after picking `commitTs`, the committer holds its tongue and does **not acknowledge the client** until:
 
 ```
    now().earliest  >  commitTs
@@ -332,7 +332,7 @@ The two halves are deliberately asymmetric and that's the point: the **committer
 
 ### Why this is usually free
 
-Commit-wait sounds like "add CEB latency to every commit." It mostly doesn't, for one structural reason: **a committing transaction must already flush its log to Aurora storage durably (6-way, 2-per-AZ — Pass 1 Rung 4), and that storage write takes longer than CEB.** The commit-wait runs **in parallel** with the storage flush. Since the storage round-trip (network + quorum acknowledge) typically exceeds the small CEB, the wait is already over by the time durability lands. Net added latency: usually ~0.
+"Wait out the lie" sounds like you just bolted CEB of latency onto every single commit. Wince-worthy. But you mostly don't pay it, for one structural reason: **a committing transaction must already flush its log to Aurora storage durably (6-way, 2-per-AZ — Pass 1 Rung 4), and that storage write takes longer than CEB.** The commit-wait runs **in parallel** with the storage flush. Since the storage round-trip (network + quorum acknowledge) typically exceeds the small CEB, the wait is already over by the time durability lands. Net added latency: usually ~0.
 
 ```
    commit:  pick commitTs ──┬── flush log to Aurora storage  (the SLOW part) ─────┐

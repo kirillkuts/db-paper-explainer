@@ -9,9 +9,9 @@
 
 ## Where we left off
 
-Pass 2 proved bit-packing decodes 3.74× faster with FastLanes than buffered scalar. That number assumes you actually decode all the values. In a real analytical query, **you rarely do**. A typical `SELECT … WHERE …` rejects 99% of rows. Decoding all 1B rows just to throw away 990M is wasted work — even at 3.74× the wasted-work rate.
+Pass 2 proved bit-packing decodes 3.74× faster with FastLanes than buffered scalar. But that number assumes you actually decode all the values — and in a real analytical query, **you rarely do**. A typical `SELECT … WHERE …` rejects 99% of rows. So decoding all 1B rows just to throw away 990M is wasted work. Going 3.74× faster only means you waste it 3.74× faster.
 
-This pass: how to evaluate predicates as close to the compressed bytes as possible, so the rejected rows pay almost nothing.
+This pass is about evaluating predicates as close to the compressed bytes as you can get, so the rejected rows pay almost nothing.
 
 ---
 
@@ -49,7 +49,7 @@ For 1B rows at FastLanes' 3.74× decode speed:
 
 ### The pain
 
-If selectivity is 1%, we materialized 1B values just to keep 10M of them. The 4 GB intermediate buffer also blows out L3 cache, so the comparator stage reads from DRAM — not from cache as it would on a tighter pipeline.
+If selectivity is 1%, we materialized 1B values just to keep 10M of them. That's 990M values decoded, written to memory, read back, and discarded. And the 4 GB intermediate buffer blows out L3 cache, so the comparator can't read from cache the way a tighter pipeline would — every value comes back from DRAM. We're paying twice: once to write the junk, once to read it.
 
 **The fix:** never let the decoded values live in memory. Either fuse decode + compare in registers, or skip decode entirely for rejected rows.
 
@@ -69,7 +69,7 @@ pos:16  17  18  19  20  21  22  23  24  25  26  27  28  29  30  31
 v:  19  26   1   8  15  22  29   4  11  18  25   0   7  14  21  28
 ```
 
-The fused scan inserts **one SIMD-compare** into Pass 2's decode loop, right after the unpack-and-mask step. Values never leave registers.
+The trick is small. Take Pass 2's decode loop and slip **one SIMD-compare** in right after the unpack-and-mask step. The unpacked values are already sitting in a register — so compare them there, record which lanes passed, and never store the values at all. The decoded numbers exist for one instruction and then evaporate.
 
 ```
    reg ← bit-unpack 4 values  (one per slot)
@@ -106,13 +106,13 @@ byte 3 (rows 24..31): 0 0 1 0 0 0 1 1  → MSB-first binary 1100 0100 = 0xC4
 
 ### What did we save?
 
-Compared to Rung 1: **no 4 GB intermediate buffer**. Values flow through registers, the bitmap is the only thing materialized (125 MB at 1B rows — 32× less). For 1% selectivity that's still wasted work *per byte*, but it's cache-friendly and bandwidth-cheap.
+Compared to Rung 1: **no 4 GB intermediate buffer**. Values flow through registers, and the only thing that lands in memory is the bitmap — 125 MB at 1B rows, 32× less than the decoded values would have been. We still touch every row, so for 1% selectivity it's still wasted work *per byte*. But now the waste is cache-friendly and bandwidth-cheap instead of a 4 GB DRAM round-trip.
 
 Cost per value: Pass 2 measured ~2.25 SIMD ops/value for FastLanes decode. Adding one compare + a mask-packing op amortized over 4 values lands roughly at **~2.5 ops/value for the full scan**. Versus Rung 1's "decode (2.25) + write (1) + read (1) + compare (1)" ≈ 5+ ops/value.
 
 ### Pain
 
-We still did the full decode work. For very low-selectivity predicates we'd love to skip the decode entirely. That requires the predicate to be expressible against the *encoded* form — which depends on the codec.
+We still did the full decode work. When a predicate rejects 99% of rows, that's galling — we'd love to skip the decode entirely for the rows we're about to throw away. But to skip the decode, you have to ask your question of the *encoded* bytes directly, without reconstructing the value first. Whether you can do that depends on the codec. The next three rungs work through one codec at a time.
 
 ---
 
@@ -128,7 +128,7 @@ offset > 200 - base
 offset > 150            ← rewrite the constant ONCE, before the scan starts
 ```
 
-Now the inner loop compares bit-packed offsets directly. The `+ base` SIMD-add per iteration **vanishes from the inner loop entirely**. The values themselves are never reconstructed.
+Here's the move: we shifted the constant once, up front, so the inner loop can compare the raw bit-packed offsets without ever adding `base` back on. The `+ base` SIMD-add that decode would have done per iteration **vanishes from the inner loop entirely**. The actual `latency_ms` value is never reconstructed — we answered the question without ever building the number.
 
 ```
 inner loop per iteration of 4 values:
@@ -139,11 +139,11 @@ inner loop per iteration of 4 values:
    ~2.5 ops per value
 ```
 
-Same cost as Rung 2 — but the *value itself never exists* in a register. For 99% rejected rows that's the whole win: we never assemble them.
+Same cost as Rung 2 — but notice what's different. In Rung 2 the value existed in a register for one instruction. Here the *value itself never exists* at all. For the 99% of rows we're going to reject, that's the whole win: we never assemble them in the first place.
 
 ### Block-level early-out (the free win)
 
-If the encoder also stored `min` and `max` for each FOR block (cheap — one pass at encode time), the planner can decide the *whole block's fate* without running the inner loop at all:
+Think of `min` and `max` as a label on the outside of a sealed box. If the box is labeled "everything inside is between 50 and 90" and you're looking for values above 200, you don't open it — you walk past. If the encoder stored `min` and `max` for each FOR block (cheap — one pass at encode time), the planner can decide the *whole block's fate* from the label, without running the inner loop at all:
 
 ```
 block_min = base + min(offsets)
@@ -158,7 +158,7 @@ For a `WHERE ts > '2024-01-01'` over a historical column, **99% of blocks short-
 
 ### Edge case — unsigned underflow
 
-The rewrite `C - base` is computed in unsigned arithmetic over packed offsets. If `C < base`, the subtraction wraps. The planner detects this *before* generating the scan and emits the all-ones early-out instead. Same for `C ≥ base + max_offset` → all-zeros early-out. The inner loop only runs when `base ≤ C < base + max_offset`.
+The rewrite `C - base` is computed in unsigned arithmetic over packed offsets, so there's a trap: if `C < base`, the subtraction wraps around to a huge number instead of going negative. But step back — if the constant is below `base`, then it's below *every* value in the block, so every row passes anyway. The planner catches `C < base` *before* generating the scan and just emits the all-ones early-out. Same logic at the top end: `C ≥ base + max_offset` means no row can reach the constant, so emit all-zeros. The inner loop only runs in the middle, when `base ≤ C < base + max_offset` — exactly the case where the answer actually varies row to row.
 
 ### Pre-empt: "what about range predicates?"
 
@@ -184,7 +184,7 @@ Query: `WHERE country_name = 'Canada'`.
 
 ### The wrong way
 
-Decode every code, gather the corresponding string from the dictionary, strcmp against `'Canada'`. That's 1B gathers (each a cache-miss) + 1B strcmps. Disaster.
+Decode every code, jump into the dictionary to fetch the string it points at, then `strcmp` that string against `'Canada'`. Do that a billion times. Each lookup is a random jump into the dictionary — a cache miss — followed by a byte-by-byte string compare. That's 1B gathers and 1B strcmps for a question that has the same answer for every row holding the same code. Disaster.
 
 ### The right way — DICT pushdown
 
@@ -197,7 +197,7 @@ step 2 (inner scan):
    emit bitmap
 ```
 
-**The dictionary is never touched during the inner scan.** strcmp runs 200 times (on dictionary entries), not 1B times. **5,000,000× reduction in string-comparison work.** And the inner loop is just an 8-bit-packed integer compare — ~1.5 SIMD ops per value, the cheapest scan in the whole pipeline.
+The insight: `'Canada'` has exactly one ID. Find it once, and the billion-row question collapses to "which codes equal 1?" — pure integer comparison. **The dictionary is never touched during the inner scan.** strcmp runs 200 times, on the dictionary entries, not 1B times on rows. That's a **5,000,000× reduction in string-comparison work.** And what's left in the inner loop is just an 8-bit-packed integer compare — ~1.5 SIMD ops per value, the cheapest scan in the whole pipeline.
 
 ### Pre-empt: `IN ('Canada', 'Mexico', 'Brazil')`
 
@@ -210,7 +210,7 @@ Both keep the dictionary out of the inner loop.
 
 ### Pre-empt: `LIKE 'United%'`
 
-Pre-scan the dictionary at planner time. Find all IDs whose string matches the LIKE pattern. The query becomes `id IN {set_of_matching_ids}` — same as above. **Wildcard string matching turns into integer set membership.** This rewrite is the single most important reason production analytical engines DICT-encode every string column.
+Same idea, one step bigger. At planner time, walk the 200-entry dictionary and find every ID whose string matches the LIKE pattern. Now the query is just `id IN {set_of_matching_ids}` — the case you already solved above. **Wildcard string matching turns into integer set membership**, evaluated once against 200 entries instead of a billion times against rows. This rewrite is the single most important reason production analytical engines DICT-encode every string column.
 
 ### Edge case — set is the whole dictionary
 
@@ -220,9 +220,9 @@ If the `IN` set contains every ID actually present in the block, emit all-ones e
 
 ## Rung 5 — DELTA pushdown: when the chain forces a decode
 
-DELTA stores `delta[i] = v[i] - v[i-T]` (per-lane in FastLanes; see Pass 2 Rung 6). To know whether `v[i] > C`, you need `v[i]`, which needs the prefix sum of all earlier deltas in the same stream.
+DELTA is the codec that fights back. It stores `delta[i] = v[i] - v[i-T]` (per-lane in FastLanes; see Pass 2 Rung 6) — each value is described only as a hop from the previous one. To know whether `v[i] > C`, you need `v[i]` itself, and the only way to get it is to add up every delta before it in the stream. A single offset doesn't tell you the value; you have to walk the chain.
 
-**There's no rewrite of the predicate to avoid the sum.** The chain is intrinsic to the codec.
+So unlike FOR and DICT, **there's no rewrite that dodges the sum.** The dependency is baked into the codec. The deltas don't carry the answer; only their running total does.
 
 ### Best you can do: fuse the compare into the prefix-sum loop
 
@@ -238,11 +238,11 @@ inner loop per iteration of 4 values:
    ~2.75 ops per value
 ```
 
-Versus FOR scan's ~2.5. **Modest 10% cost rise** for DELTA over FOR scan. Reconstructed values still never hit memory.
+Versus FOR scan's ~2.5. So forcing the chain costs us about 10% — a **modest rise**, not a wall. And we still win the big thing: the reconstructed values live in the running-sum register and never hit memory.
 
 ### The big win is at the block level
 
-DELTA blocks store the same `min` / `max` summary stats. For monotonic columns (timestamps, sequential IDs), nearly every range predicate is answered by min/max alone — the inner DELTA scan is unnecessary.
+Here's the rescue. DELTA blocks store the same `min` / `max` label on the box. And DELTA is the codec you reach for precisely on monotonic columns — timestamps, sequential IDs — where values march steadily upward. On a column like that, a block's min and max bracket a tight, ordered range, so a range predicate almost always lands entirely inside or entirely outside it. The expensive chain we just dreaded? For most blocks it never runs.
 
 ```
 WHERE ts > '2024-05-01'   on a block whose max ts is '2024-04-30'   → skip block, no decode
@@ -273,7 +273,7 @@ Per block, in order:
 4. **AND the two bitmaps** (cheap — one SIMD-AND per byte).
 5. **For matching rows only** (~0.1% of remaining block) — gather `country_id`, look up `country_name` in dictionary (200 entries → fits in cache, fast), compute `base + offset` for `latency_ms`, accumulate into the GROUP BY hash table.
 
-The expensive work (string lookup, full decode of latency, hash insertion) runs on **0.1% of rows**. The 99.9% rejected paid only the bit-packed-compare cost on two columns.
+Look at where the money went. The expensive work — string lookup, full decode of latency, hash insertion — runs on **0.1% of rows**. The other 99.9% never got decoded; they paid only the bit-packed-compare cost on two columns, then got AND-ed away. That's the thesis of the whole pass made concrete: the rows you reject should barely cost anything, and here they don't.
 
 ### Order matters
 
@@ -294,7 +294,7 @@ These tricks aren't free at the encoder. The encoder writes, per block:
 - The `base` for FOR columns (typically `min(values)`, computed during the min/max pass).
 - The codec choice itself.
 
-A few extra seconds per GB at write time. Amortized over thousands of future queries hitting the same column, it pays back instantly. This is why FastLanes targets analytical storage (write once, read many) — for OLTP the math reverses.
+It costs a few extra seconds per GB at write time. Is that worth it? You pay it once, and every future query that touches the column gets to skip blocks and dodge decodes for free. Amortized over thousands of reads, those seconds pay back almost immediately. This is exactly why FastLanes targets analytical storage — write once, read many. Flip the ratio to OLTP, where you write constantly and read little, and the math reverses: you'd be paying the encode tax over and over for queries that never come.
 
 ---
 

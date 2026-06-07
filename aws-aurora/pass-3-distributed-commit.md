@@ -50,7 +50,7 @@ This is the cross-shard torn read from Pass 0 Rung 2, now *inside* the system. A
 
 ### The classic tool: two-phase commit (2PC)
 
-**2PC** = two-phase commit, the textbook protocol for atomic commit across machines. A **coordinator** drives **participants** through two phases:
+Think of a wedding officiant. Before declaring the couple married, they ask each party "do you?" and wait for both yesses — only then do they pronounce it. Nobody is half-married. That two-question-then-pronounce shape is exactly **2PC** = two-phase commit, the textbook protocol for atomic commit across machines. A **coordinator** (the officiant) drives **participants** through two phases:
 
 ```
    PHASE 1 — PREPARE
@@ -79,7 +79,7 @@ The promise is the crux: after a participant says PREPARED, it has surrendered t
        until the coordinator comes back.
 ```
 
-This is the **blocking problem** of 2PC. Prepared participants sit holding locks, unable to move, for as long as the coordinator is down. For an OLTP system where the coordinator might be down for **minutes**, that is unacceptable: a single coordinator death freezes rows across the cluster.
+This is the **blocking problem** of 2PC. Picture the officiant fainting right after both yesses but before pronouncing the couple married — everyone stands frozen at the altar, nobody willing to leave. That's the prepared participants: holding locks, unable to move, for as long as the coordinator is down. For an OLTP system where the coordinator might be down for **minutes**, that's unacceptable. One coordinator death freezes rows across the cluster.
 
 So the question that drives the rest of this commit story is: **how do we get 2PC's atomicity without 2PC's blocking?**
 
@@ -295,7 +295,7 @@ A single-shard write is its own lead shard and its own — and only — particip
 
 ## Rung 5 — Reading from shards under skew (§5.5)
 
-Commit is solved. Now the genuinely hard half: a **reader** lands on a shard and must apply Property 1 correctly, even though (a) the shard's clock is skewed relative to the reader's, (b) a writer to the very row may be **half-prepared** on another shard, and (c) a writer may have its `commitTs` but not yet be durable. Three sub-rungs, each its own pain.
+Commit is solved. Now the genuinely hard half. Don't tense up — it's three separate small problems wearing one scary label, and we take them one at a time. A **reader** lands on a shard and must apply Property 1 correctly, even though (a) the shard's clock is skewed relative to the reader's, (b) a writer to the very row may be **half-prepared** on another shard, and (c) a writer may have its `commitTs` but not yet be durable. Three sub-rungs, each its own pain.
 
 Recall the reader's tool, unchanged: **Property 1 — `T` sees `T'` iff `T'.commitTs <= T.startTs`.** The trouble is making sure that comparison is *safe* against a shard that hasn't yet (or has only partially) decided the commitTs of a relevant writer.
 
@@ -374,7 +374,7 @@ Note the prepare timestamp in Rung 3 was glossed as `now().latest` — the full 
    S cannot decide locally. And T' is PREPARED (promised) — S can't just ignore it.
 ```
 
-A prepared writer is a landmine: it *will* commit (it promised), at a commitTs S can't predict, that may or may not fall under T.startTs. S cannot guess.
+A prepared writer is a landmine. It *will* commit — it promised — at a commitTs S can't predict, that may or may not fall under T.startTs. So can S just guess? No. Either guess is a coin flip, and a wrong flip means a torn read.
 
 **The fix: S inquires the lead shard, passing `T.startTs`.** Shard S knows the lead-shard ID (it persisted it at prepare time, Rung 3 step 3). So:
 

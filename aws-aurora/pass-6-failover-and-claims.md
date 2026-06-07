@@ -20,9 +20,11 @@
 
 ## Rung 1 — The pain: a "dead" instance might be a live zombie, and split-brain writes corrupt data
 
+Think of a night watchman who stops answering his radio. Maybe he collapsed. Maybe he's just in a dead spot. You can't tell from the other end — so you send a replacement. But if the first guy was only out of range and wanders back to his post, you now have two watchmen both certain they're on duty. That's the whole problem of this rung.
+
 Every shard runs on a compute **instance** (a Postgres-derived process on a machine). Instances fail, hang, or get network-partitioned. The HA system (Pass 1 §3.4) watches them: when an instance stops responding to health checks, it is **suspected dead** and a **replacement instance** is launched to take over that shard.
 
-Here is the trap. "Suspected dead" is a *guess*, made over an unreliable network. The original instance might be:
+Here's the trap. "Suspected dead" is a *guess*, made over an unreliable network. The original instance might be:
 
 ```
    genuinely dead         → replacement is correct, no problem
@@ -83,7 +85,7 @@ So the write-fence isn't enough. We must stop a zombie from serving reads it can
 
 > **Read lease:** a time-bounded permission for an instance to serve reads up to a certain snapshot time. It is granted *as a side effect of a successful storage write*, and it expires. An instance that cannot renew its lease must assume it has been replaced and stop serving.
 
-**First, pin the timescale — this is the thing that makes the whole comparison work.** The lease end and a reader's `startTs` (Pass 2) live on the **same number line: the Amazon Time Sync timeline.** The lease is granted at the granting write's commit/HLC timestamp, and that timestamp is minted by the *same* rule as every other timestamp in the system — `max(C, now().latest)` (Pass 3). So when we write "the write's timestamp is `t`", `t` is a Time-Sync-anchored value, not some private shard-clock counter that could be skewed off everyone else's. That means comparing a reader's `startTs` against `t + TTL` is the **exact same scalar comparison as Property 1** — both operands are on one timeline. There is no hidden skew to reconcile.
+Before the mechanism, one setup step — and it's the load-bearing one, so it's worth pinning down carefully. Where does the lease end "live"? On the **same number line as a reader's `startTs` (Pass 2): the Amazon Time Sync timeline.** Here's why. The lease is granted at the granting write's commit/HLC timestamp, and that timestamp is minted by the *same* rule as every other timestamp in the system — `max(C, now().latest)` (Pass 3). So when we write "the write's timestamp is `t`", `t` isn't some private shard-clock counter that could be skewed off everyone else's. It's a Time-Sync-anchored value. And that's the payoff: comparing a reader's `startTs` against `t + TTL` is the **exact same scalar comparison as Property 1** — both operands sit on one timeline. No hidden skew to reconcile.
 
 The mechanism, in two rules:
 
@@ -135,7 +137,7 @@ The lease ties "am I allowed to answer this read?" to "have I recently proven I 
 
 ## Rung 3 — Failover wait: why a new instance must pause before serving
 
-Rung 2 stopped the zombie from serving reads outside its lease. But there's a symmetric danger on the **new** side: when a replacement (or a recovering instance) comes up, it must not commit a transaction at a `commitTs` that could *conflict* with what the old lease already authorized. Otherwise a zombie still inside its (not-yet-expired) lease could serve a read that *should* have seen the new instance's commit but doesn't — re-opening the Rung-2 anomaly from the other direction.
+Rung 2 stopped the zombie from serving reads outside its lease. So are we done? Not quite — the same danger lurks on the **new** side. When a replacement (or a recovering instance) comes up, it mustn't rush in and commit a transaction at a `commitTs` that overlaps a lease window the old instance was still allowed to honor. Picture it from the zombie's seat: it's still inside its not-yet-expired lease, happily serving a read, and the new instance just committed a write at a timestamp that read *should* have seen — but the zombie never got the memo. Same Rung-2 anomaly, approached from the other direction.
 
 The fix is a short, principled **failover wait**:
 
@@ -189,9 +191,9 @@ So the failover wait is a correctness backstop that, in the common case, costs n
 
 ## Rung 4 — Backups and recovery: the payoff of timestamps everywhere (§6)
 
-Single-node Postgres backups are "a consistent snapshot of one database." A *distributed* system needs something stronger and it's the place the whole timestamp design finally cashes out: a backup must be a **consistent cut across all shards** — every shard frozen at the *same logical instant*, so the backup never contains half of a cross-shard transfer.
+Imagine photographing a relay race to prove who held the baton at the gun. One camera is easy. But if you have one camera per runner and they don't fire at the exact same instant, your photos can show the baton in two hands at once — or in none. A single-node Postgres backup is the one-camera case: "a consistent snapshot of one database." A *distributed* system is the relay race, and this is the place the whole timestamp design finally cashes out: a backup must be a **consistent cut across all shards** — every shard frozen at the *same logical instant*, so it never captures half of a cross-shard transfer.
 
-The pain, if you did it naively: back up shard 0 at 12:00:00.000 and shard 2 at 12:00:00.050, and a transfer that committed at 12:00:00.030 would be in shard 0's backup but missing from shard 2's — a **torn backup**, the Pass-3 torn-read reborn in cold storage.
+Picture doing it naively. Back up shard 0 at 12:00:00.000 and shard 2 at 12:00:00.050, and a transfer that committed at 12:00:00.030 lands in shard 0's backup but vanishes from shard 2's. That's a **torn backup** — the Pass-3 torn-read, reborn in cold storage.
 
 ### The mechanism: a backup is defined by a single timestamp `t`
 

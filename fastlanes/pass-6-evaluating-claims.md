@@ -28,7 +28,7 @@ The FastLanes paper's headline is roughly "**~4× faster decompression at equal 
 3. **on what data?** Bit-width matters. Cascade complexity matters. Real distributions vs uniform random matters.
 4. **measured how?** Throughput in GB/s of *compressed bytes* read? Of *decoded values* written? Latency for one block? End-to-end query time?
 
-A 4× claim under one combination can be 1.2× under another. The pain: most readers see "4×", anchor on it, and never check the conditions.
+Think of "4×" like a car's advertised gas mileage. True on a flat highway at a steady 55. Not what you get in city traffic. A 4× claim under one combination can be 1.2× under another. Here's the trap: most readers see "4×", anchor on it, and never check the conditions printed in the fine print.
 
 **The fix:** track all four answers when reading any benchmark. The rest of this pass walks each one.
 
@@ -40,9 +40,9 @@ There are three honest baselines for a SIMD bit-packing codec. Each tells you a 
 
 ### Baseline A — Raw scalar (one byte load per value)
 
-The unbuffered loop. ~12 ops per value (Pass 2 Rung 6 naive scalar). **Not a real baseline** — nobody ships unbuffered scalar in production. The win against raw scalar is artificial: any SIMD codec looks 5–10× faster, regardless of cleverness.
+The unbuffered loop. ~12 ops per value (Pass 2 Rung 6 naive scalar). **Not a real baseline** — nobody ships unbuffered scalar in production. Why does it flatter the new system? Because it's a punching bag: any SIMD codec looks 5–10× faster than it, regardless of cleverness. You're racing a parked car.
 
-When a paper compares against raw scalar without also showing buffered scalar — that's the tell. The real win is being hidden.
+So when a paper compares against raw scalar without also showing buffered scalar — that's the tell. The real win is being hidden.
 
 ### Baseline B — Buffered scalar (shift-register decode)
 
@@ -62,7 +62,7 @@ So the comparison is a **two-axis Pareto improvement**, not a single number. Fas
 
 ### What to look for in the paper
 
-Demand all three baselines. If the paper only shows vs raw scalar — they're hiding behind a weak comparison. If the paper only shows vs BP128 — they're hiding the absolute speed against the scalar floor. A trustworthy systems paper shows **buffered scalar AND BP128**, on the same hardware, same data, same SIMD width.
+Demand all three baselines. Show only vs raw scalar, and they're hiding behind a punching bag. Show only vs BP128, and they're hiding the absolute speed against the scalar floor — you can't tell if SIMD even helped. A trustworthy systems paper shows **buffered scalar AND BP128**, on the same hardware, same data, same SIMD width. No moving the goalposts between comparisons.
 
 ---
 
@@ -96,7 +96,7 @@ These are *order-of-magnitude estimates*, not paper numbers. The point: **the 4�
 
 A good systems paper reports throughput for **multiple SIMD widths**, with the same data. FastLanes' interpretability property (Pass 2 Rung 5) is what makes this possible — the same bytes decode on every width — so the paper has no excuse to report only one width.
 
-If the paper only reports AVX-512 numbers, ask: "what does this look like on the ARM Mac people actually own?" The answer is probably less impressive.
+If the paper only reports AVX-512 numbers, ask the awkward question: "what does this look like on the ARM Mac people actually own?" The answer is probably less impressive — and that's exactly why it got left out.
 
 ---
 
@@ -126,9 +126,9 @@ These should appear in a "real-world distributions" section. If they don't, the 
 
 ## Rung 5 — Hot vs cold cache: where does the data live?
 
-A 1024-value block at 8 bits/value = **1 KB**. **Fits in L1 cache.** Microbenchmarks that decode the same block 1M times measure pure compute throughput, with the data permanently resident in L1 cache.
+Where the data lives changes everything — like the difference between cooking with ingredients on the counter versus running to the store for each one. A 1024-value block at 8 bits/value = **1 KB**. **Fits in L1 cache** — it's on the counter. Microbenchmarks that decode the same block 1M times measure pure compute throughput, the data permanently resident in L1.
 
-Real query workloads scan GB of data. The column doesn't fit in any CPU cache. The decoder is **bandwidth-bound**.
+Real query workloads scan GB of data. The column doesn't fit in any CPU cache, so every value means a trip to the store. The decoder is **bandwidth-bound** — it spends its time waiting for memory, not computing.
 
 Three cache regimes:
 
@@ -142,7 +142,7 @@ Pass 2 Example 8 deliberately pushed the workload past L3 (50M values × 17 bits
 
 ### Real-world consequence
 
-For a real 100 GB OLAP column, you're firmly in DRAM-resident regime. FastLanes' decode-compute speedup matters less than the *compressed bytes you have to move*. **A 2× tighter compression ratio is worth more than a 2× decode speedup at scale**, because both halve the bandwidth need but tighter compression *also* halves disk and network cost.
+For a real 100 GB OLAP column, you're firmly in DRAM-resident regime — running to the store for everything. At that point FastLanes' decode-compute speedup matters less than the *compressed bytes you have to move*. Fast hands don't help when you're stuck in traffic. **A 2× tighter compression ratio is worth more than a 2× decode speedup at scale**, because both halve the bandwidth need but tighter compression *also* halves disk and network cost.
 
 This is why the FastLanes paper's pitch is "**4× decode at equal or better compression**" — the "equal or better compression" half does most of the user-visible work in real deployments.
 
@@ -173,7 +173,7 @@ new_query = 0.30 / 4 + 0.70 = 0.075 + 0.70 = 0.775   (of original time)
 end-to-end speedup = 1 / 0.775 ≈ 1.29×
 ```
 
-A 4× decode win → **1.29× end-to-end**. Smaller, but real.
+A 4× decode win → **1.29× end-to-end**. This is Amdahl's law biting: speed up a part, and the parts you didn't touch set the ceiling. Smaller, but real.
 
 ### When end-to-end EXCEEDS microbenchmark
 
@@ -191,7 +191,7 @@ A trustworthy paper reports both microbenchmark *and* end-to-end TPC-H (or simil
 
 ## Rung 7 — What a trustworthy systems paper does *not* claim
 
-The strongest signal of an honest paper is what it carves out as **not** in its claim. For FastLanes, the implicit limits are:
+Here's a counterintuitive tell: the strongest signal of an honest paper is what it refuses to claim. A salesperson lists only upsides; an engineer tells you where the thing breaks. For FastLanes, the implicit limits are:
 
 | Limit | Reason | What the paper should acknowledge |
 |---|---|---|

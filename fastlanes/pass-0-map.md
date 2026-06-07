@@ -25,7 +25,7 @@ The table has **1 billion rows**. Stored as raw 4-byte integers:
 1,000,000,000 rows × 4 bytes = 4 GB per column
 ```
 
-A query like `SELECT AVG(latency_ms) WHERE country_id = 7` has to **scan all 4 GB** off disk (or RAM) just to compute one number. Disk reads + memory bandwidth = the slowest things in a CPU's life.
+A query like `SELECT AVG(latency_ms) WHERE country_id = 7` has to **scan all 4 GB** off disk (or RAM) just to compute one number. And moving those bytes is the slow part — disk reads and memory bandwidth are the slowest things in a CPU's life. The arithmetic is free by comparison; the CPU sits idle waiting for data to arrive.
 
 **The pain:** scanning raw columns is bandwidth-bound. Smaller column = faster query.
 **The fix:** compress.
@@ -34,9 +34,9 @@ A query like `SELECT AVG(latency_ms) WHERE country_id = 7` has to **scan all 4 G
 
 ## Rung 2 — The simplest compression: bit-packing
 
-`latency_ms < 2000` means **every value fits in 11 bits** (because 2¹¹ = 2048). We're storing 32 bits and wasting 21 of them on leading zeros.
+Think of it like writing the number 5 on a form with thirty blank boxes — you fill one box and leave twenty-nine empty. That's what a 32-bit integer does to a small value. `latency_ms < 2000` means **every value fits in 11 bits** (because 2¹¹ = 2048). So we're storing 32 bits and wasting 21 of them on leading zeros, every single value, a billion times over.
 
-Bit-packing: use only the bits you need.
+Bit-packing fixes that: use only the bits you need, and stop there.
 
 ```
 value 5     in 32 bits: 00000000 00000000 00000000 00000101    ← 27 bits wasted
@@ -57,7 +57,7 @@ read 16 bits starting at byte (bit_position / 8)
 shift right by `shift`, mask with 0b11111111111 (11 ones)
 ```
 
-Two instructions: shift, mask. Per value. **One value at a time.**
+Two instructions: shift, then mask. Per value. **One value at a time.** That last part is the catch.
 
 ### Pain
 
@@ -69,7 +69,7 @@ Two instructions: shift, mask. Per value. **One value at a time.**
 
 ## Rung 3 — SIMD: many values per instruction
 
-Modern CPUs have **SIMD** ("Single Instruction Multiple Data") registers — wide registers split into independent **slots** ("lanes"). One instruction operates on all slots at once.
+Doing one value at a time leaves most of the CPU idle. Modern CPUs have **SIMD** ("Single Instruction Multiple Data") registers — wide registers split into independent **slots** ("lanes"), like an egg carton with eight cups. One instruction operates on all cups at once instead of one at a time.
 
 ```
 AVX2 register = 256 bits = 8 slots × 32 bits each:
@@ -82,7 +82,7 @@ AVX2 register = 256 bits = 8 slots × 32 bits each:
 One SIMD-add instruction adds 8 pairs of 32-bit numbers simultaneously.
 ```
 
-**The rule of SIMD:** each slot does its **own** work using only its **own** bits. The instant a slot needs to reach into another slot's bits, the CPU stalls (cross-lane shuffle = slow).
+There's one catch, and it's the whole story of this paper. **The rule of SIMD:** each slot does its **own** work using only its **own** bits. The cups don't talk to each other. The instant a slot needs to reach into another slot's bits, the CPU has to stall and shuffle the data across — and a cross-lane shuffle is slow. Keep that rule in your head; everything below is about not breaking it.
 
 ### Trying SIMD on bit-packed data — and watching it fail
 
@@ -104,7 +104,7 @@ slot 2 ← bits  64–95    ...
 slot 3 ← ...
 ```
 
-Look at v2. The bottom 10 bits are in **slot 0**. The top 1 bit is in **slot 1**. To assemble v2, slot 1 must read into slot 0. **Cross-lane shuffle.** SIMD's promise dies.
+Now look at v2. The bottom 10 bits landed in **slot 0**. The top 1 bit landed in **slot 1**. To put v2 back together, slot 0 has to reach into slot 1 — exactly the move the rule forbids. **Cross-lane shuffle.** And it's not one bad value: because 11 doesn't divide evenly into 32, the boundaries drift and almost every value ends up split. SIMD's promise dies.
 
 **The pain:** straight bit-packing places value boundaries wherever they fall, which means they straddle slot boundaries.
 **The fix:** rearrange the data so straddles never happen between slots.
@@ -123,9 +123,9 @@ slot 1: [v1 11b][21 bits of zero]
 ...
 ```
 
-**Works for SIMD.** Breaks compression: 21 of 32 bits wasted = **66% waste**. We're back to 4 GB. Compression ratio is gone.
+**Works for SIMD** — every value sits alone in its slot, no straddles. But look what it costs: 21 of 32 bits wasted = **66% waste**. We're back to 4 GB. We bought speed by throwing away the entire reason we compressed.
 
-For 5-bit values you'd waste 27/32 = 84%. For 17-bit values, you'd waste 47%. Padded packing breaks badly for values close to slot size.
+And it gets worse for smaller values. For 5-bit values you'd waste 27/32 = 84%. For 17-bit values, 47%. Padding only breaks even when values happen to fill the slot — the rest of the time it's just the original problem wearing a disguise.
 
 ### Fix B — bit-slice: lane *i* holds bit-*i* of many values
 
@@ -156,7 +156,7 @@ SIMD load (128 bits):
   slot 3 ← slot3 word0
 ```
 
-Inside slot 0, the stream looks like normal scalar bit-packing — values straddle word boundaries, but **the straddle is between two consecutive words of the SAME slot**. Recombining them is a `shift + OR` **inside the slot**. No cross-lane access.
+Here's the trick. Straddles don't disappear — inside slot 0 the stream still looks like ordinary scalar bit-packing, and values still cross word boundaries. But now **the straddle is between two consecutive words of the SAME slot**, not between two different slots. Slot 0 only ever reaches into its own next word, which it already holds. Recombining is a `shift + OR` that never leaves the lane. The rule stays unbroken.
 
 **Zero waste + full SIMD parallelism + lane-independent.** This is **FastLanes**.
 
@@ -164,9 +164,9 @@ Inside slot 0, the stream looks like normal scalar bit-packing — values stradd
 
 ## Rung 5 — Why "every 4th value" is the magic
 
-You might ask: why does slot 0 own `v0, v4, v8, v12, …` instead of `v0, v1, v2, v3, …`?
+You might ask: why does slot 0 own `v0, v4, v8, v12, …`? Wouldn't it be simpler to give slot 0 the first chunk, `v0, v1, v2, v3, …`?
 
-Because of **how SIMD writes its output back to memory**. When the decoder finishes one iteration, all 4 slots emit one value each:
+It would — until you look at **how SIMD writes its output back to memory**. When the decoder finishes one iteration, all 4 slots emit one value each, side by side:
 
 ```
 iteration 0:  slot 0 → v0    slot 1 → v1    slot 2 → v2    slot 3 → v3
@@ -176,7 +176,7 @@ iteration 2:  slot 0 → v8    slot 1 → v9    slot 2 → v10   slot 3 → v11
 
 Stored to output, the array comes out **in natural order**: `v0, v1, v2, v3, v4, v5, v6, v7, …` — no post-decode reshuffle needed.
 
-If instead slot 0 had `v0..v255` contiguous, output would be `v0, v256, v512, v768, v1, v257, …` — scrambled. You'd need a permute pass to fix it. The every-Nth assignment sidesteps that.
+Now try it the "simple" way. If slot 0 held `v0..v255` contiguous, the same side-by-side writes would spit out `v0, v256, v512, v768, v1, v257, …` — scrambled, and you'd need a whole permute pass just to unscramble it. So the every-Nth assignment isn't a quirk; it's the one choice that makes the output land already sorted, for free.
 
 ---
 

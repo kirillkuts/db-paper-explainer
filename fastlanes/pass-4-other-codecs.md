@@ -17,7 +17,7 @@ One new term shows up in Rung 1:
 
 ## Rung 1 — Classical DELTA: the Hillis-Steele scan, traced bit-by-bit
 
-Classical DELTA encodes `delta[i] = v[i] - v[i-1]`. To reconstruct, each value depends on the running total of every delta before it.
+Classical DELTA encodes `delta[i] = v[i] - v[i-1]` — store the gap between each value and the one before it. To reconstruct, you can't read any single value in isolation: each one depends on the running total of every delta before it. Think of a bank statement that lists only deposits and withdrawals — to know today's balance you have to add up everything since the opening line.
 
 Concrete numbers (from playground Example 3):
 
@@ -60,7 +60,7 @@ add first_value (100) to every lane:
 these are v[1..5].  ✓  matches original.
 ```
 
-Each step **doubles the reach** of every lane. After `log₂(N)` steps, the highest lane holds the full prefix sum.
+Each step **doubles the reach** of every lane — step 1 lets a lane see its neighbor, step 2 lets it see two lanes back, and so on. After `log₂(N)` steps, the highest lane has reached all the way down and holds the full prefix sum.
 
 ### Cost per value
 
@@ -72,7 +72,7 @@ Total ≈ 3.25 ops per value. This is the **classical** DELTA inner loop.
 
 ### The pain
 
-The scan stage is correct and fast — but it exists *only because the encoder chose to make each value depend on its immediate predecessor*. That cross-lane data dependency is what forces the log₂(N) shifts. **The dependency is a choice, not a law.**
+Here's the thing. The scan stage is correct and fast — but step back and ask *why it has to exist at all*. It exists only because the encoder chose to make each value depend on its immediate predecessor. That one choice is what chains the lanes together, and that chain is what forces the log₂(N) shifts. So the cost isn't coming from the data. It's coming from a decision. **The dependency is a choice, not a law.**
 
 **The fix:** change which value each delta refers to so the dependency vanishes from inside a chunk.
 
@@ -105,7 +105,7 @@ stream 2 (slot 2):  v2,  v6,  v10, v14, ...
 stream 3 (slot 3):  v3,  v7,  v11, v15, ...
 ```
 
-**Within each stream, the values are at exactly stride T from each other.** So `d4 = v4 - v0` is "delta within stream 0." Each stream is its own independent classical-DELTA chain. **The cross-lane dependency is gone.**
+Look at what that means. **Within each stream, the values sit at exactly stride T from each other.** So `d4 = v4 - v0` isn't a cross-lane gap at all — it's just "the delta within stream 0," `v4` minus the previous value *in its own stream*. Do this for every stream and each one becomes its own private classical-DELTA chain, running in parallel, never reaching across to a neighbor. **The cross-lane dependency is gone.** That's the whole trick: same DELTA idea, just pointed T positions back instead of one.
 
 ### The decode loop
 
@@ -176,7 +176,7 @@ A 10-billion-row metrics-event timestamp column. Classical DELTA decode = bandwi
 
 ## Rung 3 — DICT decode: the gather instruction, traced
 
-DICT replaces each value with a small integer code; the decoder fetches the original from a dictionary table.
+DICT replaces each value with a small integer code, then keeps a lookup table — a dictionary — mapping each code back to its original value. It's a coat-check: you hand over the bulky value, get back a numbered ticket, and the decoder redeems the ticket later. The codes are tiny and bit-pack beautifully; the bulky originals live in one place.
 
 Toy example: a country column DICT-encoded with 4 distinct values.
 
@@ -205,7 +205,7 @@ result    ← gather(base=&dict[0], indices=codes_reg)
 
 ### Cost per value: cycles, not just ops
 
-Unlike bit-packed unpack (1 op = 1 cycle), a gather is **not one cycle**. It internally issues N independent loads and waits for the slowest one. Typical latency on x86:
+Here's where DICT differs from everything else in this pass. Bit-unpacking is pure arithmetic — 1 op, 1 cycle, no surprises. A gather is **not one cycle**, because it doesn't compute anything; it goes to memory. Under the hood it fires off N independent loads and can't finish until the slowest one comes back. So its cost isn't set by the instruction — it's set by where the dictionary happens to live. Typical latency on x86:
 
 | Dictionary size | Where it lives | Gather latency | Effective ops/value |
 |---|---|---|---|
@@ -221,7 +221,7 @@ The encoder caps DICT at a distinct-count threshold (typically ≤ 65,536 entrie
 
 ### Variable-length entries (strings)
 
-Strings break the gather: each entry has its own length, so there's no fixed stride for the gather to use.
+Strings break the gather. A gather assumes every entry is the same size, so it can jump straight to entry `k` by multiplying. Strings don't play along — "Canada" and "United States" have different lengths, so there's no fixed stride to multiply by. The coat-check tickets are all the same size; the coats aren't.
 
 Standard fix — two-level indirection:
 
@@ -262,7 +262,7 @@ lane 2: emit 3 copies of 33
 lane 3: emit ... whatever
 ```
 
-SIMD requires **identical per-lane behavior**. Different output sizes per lane breaks the contract. Three real approaches, ranked:
+And that's the rub. SIMD's deal is that every lane does the *same* thing in lockstep — same op, same number of results out. RLE asks each lane to emit a different count. That breaks the contract at its core, which is why there's no clean one-instruction answer here the way there was for DELTA and DICT. Three real approaches, ranked:
 
 ### Approach A — AVX-512 `VPEXPAND` (hardware-specific)
 
@@ -305,7 +305,7 @@ For full-column sequential scans, REE matches classical RLE — you just walk bo
 
 ### Why the FastLanes paper does not chase a SIMD-RLE breakthrough
 
-Honest framing: **RLE wins are bandwidth wins, not compute wins.** If a column compresses 100× under RLE, the decoded output is 100× larger than the input. Decoding a 40 MB compressed column produces 4 GB of output. On a 50 GB/s memory subsystem, *writing* the output takes ~80 ms regardless of whether the inner loop is SIMD or scalar. The decode is **bound by the store bandwidth**, not the unpack throughput.
+Here's the honest framing: **RLE wins are bandwidth wins, not compute wins.** Follow the sizes and you'll see why a faster inner loop wouldn't help. If a column compresses 100× under RLE, the decoded output is 100× *larger* than the input — that's the point of decompressing. Decode a 40 MB compressed column and you produce 4 GB of output. Now ask where the time goes. On a 50 GB/s memory subsystem, just *writing* those 4 GB takes ~80 ms, and you pay that whether the inner loop is hand-tuned SIMD or plain scalar. The bytes have to land in RAM either way. So the decode is **bound by the store bandwidth**, not the unpack throughput — speeding up the unpack speeds up nothing.
 
 So the FastLanes paper:
 1. Uses classical RLE where it pays (low-cardinality categoricals, often after DICT).
@@ -358,7 +358,7 @@ decoding (read side, one iteration of 4 values, W=4):
 
 Pass 2 measured DELTA+bit-pack at ~2.25 ops/value (Example 8). Adding FOR is ~0.25 op/value extra. The math lines up at ~1.75–2.25 depending on byte-load amortization assumptions.
 
-**The point:** every codec in the cascade adds *one SIMD op per chunk of T values*. A 3-stage cascade is not 3× the cost of bit-packing alone — it's bit-packing + 2 SIMD ops/chunk + 0 memory round-trips. Cascades stack additively, not multiplicatively.
+**The point:** every codec in the cascade adds *one SIMD op per chunk of T values* — that's it. You might expect a 3-stage cascade to cost 3× a single codec, the way nested loops multiply. It doesn't. Each stage is just one more add layered onto the same register, with no trip back to memory in between: bit-packing + 2 SIMD ops/chunk + 0 memory round-trips. Cascades stack additively, not multiplicatively.
 
 ### Pre-empt: "What changed when DELTA went per-lane?"
 

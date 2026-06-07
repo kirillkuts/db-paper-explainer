@@ -22,7 +22,7 @@ Stock PostgreSQL is **single-primary**. Exactly one node accepts writes. Read re
             replica replica replica   ← read-only copies
 ```
 
-For most apps this is fine. It stops being fine when you outgrow **one machine** on any of three axes:
+For most apps this is fine. It stops being fine the day you outgrow **one machine** — and there are three different ways to outgrow it:
 
 - **Write throughput** — the primary's CPU/IO is a single ceiling. You can buy a bigger box (vertical scaling), but the biggest box is still one box.
 - **Storage** — one volume, one filesystem. Tens of terabytes is a stretch; hundreds is painful.
@@ -51,11 +51,11 @@ app code computes:  shard = hash(customer_id) % 4
 
 Write throughput scales. Storage scales. Connections spread out. So what's wrong?
 
-**The application now owns the hard parts of a database.** Three concrete failures:
+Here's the catch. **The application now owns the hard parts of a database.** Picture three concrete failures:
 
 1. **Cross-shard transactions lose atomicity.** Move money from a customer on shard 0 to one on shard 2. That's two separate Postgres transactions on two separate machines. If shard 0 commits and shard 2 crashes, money vanishes. Stock Postgres `BEGIN/COMMIT` only spans one node.
 
-2. **Cross-shard reads lose a consistent snapshot.** A report summing balances across all four shards reads shard 0, then shard 1, then 2, then 3. Other transactions commit in between. You get a total that **never existed at any single instant** — a torn read.
+2. **Cross-shard reads lose a consistent snapshot.** A report summing balances across all four shards reads shard 0, then shard 1, then 2, then 3. While you're walking that line, other transactions commit behind you. The total you hand back **never existed at any single instant** — it's a photo stitched from four different moments. That's a torn read.
 
 3. **The schema is frozen.** Adding a shard means re-hashing and physically moving rows, by hand, while the app keeps running. Re-sharding live is a project, not a config change.
 
@@ -69,7 +69,7 @@ Write throughput scales. Storage scales. Connections spread out. So what's wrong
 
 ## Rung 3 — Split the roles: routers vs. shards
 
-Aurora Limitless's first structural idea: not every node should do the same job. Separate the node that **talks to clients and plans queries** from the node that **owns data and executes**.
+Think of a busy restaurant. The waiters take your order and run between tables; the cooks own the kitchen and do the actual work. Nobody asks a waiter to also fry the steak. Aurora Limitless's first structural idea is exactly that division of labor: separate the node that **talks to clients and plans queries** from the node that **owns data and executes**.
 
 ```
         clients (think they're talking to one Postgres)
@@ -99,7 +99,7 @@ This directly answers Rung 1's three axes: connections scale with routers, stora
 
 > Why two tiers instead of "every node does everything" (peer-to-peer, like some NoSQL systems)? Because connection-heavy OLTP and data-heavy execution scale at *different rates*. Splitting them lets you grow each independently. The exact data model (how tables are partitioned, co-location, reference tables) is **Pass 1**.
 
-**The pain that's now exposed:** we have many independent Postgres-derived shards. The instant a transaction touches two of them, we are *right back* at Rung 2's atomicity and snapshot problems — just hidden inside the system instead of the app. Splitting roles didn't solve consistency; it relocated it.
+**The pain that's now exposed:** we have many independent Postgres-derived shards. The moment a transaction touches two of them, we're *right back* at Rung 2's atomicity and snapshot problems — only now they're hiding inside the system instead of in the app. Splitting roles didn't solve consistency. It just moved the problem somewhere we can't see it.
 
 ---
 
@@ -113,7 +113,7 @@ So how does stock Postgres decide what a transaction can see, and why does that 
 stock Postgres snapshot = { list of in-flight xids }   ← a SET, lives on one node
 ```
 
-That set is **local to one primary**. There is no shared, agreed-upon set across four independent machines. You cannot ask "is xid 5012 in-flight?" globally without a central coordinator handing out xids and tracking them — which becomes a bottleneck and a single point of failure (the very thing we're trying to escape).
+Now notice where that set lives. It's **local to one primary**. There's no shared, agreed-upon copy across four independent machines. Want to ask "is xid 5012 still in-flight?" across the whole cluster? You can't — not without one central node handing out every xid and tracking them all. And that node is exactly the bottleneck and single point of failure we set out to escape.
 
 > Disambiguation: "snapshot" here means *the visibility set a transaction reads against*, not a storage backup. We'll keep these separate throughout.
 
@@ -144,11 +144,11 @@ toy example (small integer timestamps):
   row B written by txn with commitTs = 140  → 140 <= 100  →  NOT visible (committed in reader's future)
 ```
 
-Why this is the unlock: a timestamp is a **scalar**. Every shard can evaluate `commitTs <= startTs` **on its own**, with zero coordination, no shared in-flight list, no central xid dispenser. The snapshot is just a number you carry to each shard.
+Why is this the unlock? Because a timestamp is a **scalar** — one number. Every shard can evaluate `commitTs <= startTs` **on its own**: no coordination, no shared in-flight list, no central xid dispenser. The snapshot is no longer a set you have to agree on; it's just a number you carry to each shard and hand over at the door.
 
-But scalars across machines raise an obvious objection: **whose clock?** Four shards, four clocks, all skewed. If shard 2's clock runs 5 time-units ahead, its commit timestamps look artificially "in the future" and break the comparison.
+But a number across machines raises the obvious objection — and you're probably already forming it. **Whose clock?** Four shards, four clocks, none of them perfectly in sync. If shard 2's clock runs 5 time-units fast, its commit timestamps look like they're "in the future," and the comparison quietly lies.
 
-Aurora's answer: **Amazon Time Sync**, a hardware-assisted clock service that bounds how far any two nodes' clocks can disagree. That bound is called the **CEB** (ClockErrorBound) — the maximum the local clock might be off from true time.
+Aurora's answer is **Amazon Time Sync**, a hardware-assisted clock service that bounds how far any two nodes' clocks can drift apart. That bound has a name: the **CEB** (ClockErrorBound) — the most the local clock might be off from true time.
 
 ```
 real clock isn't a point, it's an interval:
@@ -180,9 +180,9 @@ PHASE 1 (prepare):  coordinator → all shards: "can you commit?"
 PHASE 2 (commit):   coordinator → all shards: "commit now"
 ```
 
-Classic 2PC has a notorious flaw: if the coordinator dies between phases, prepared shards sit **blocked** — holding locks, unable to commit or abort — until the coordinator recovers. That stall is unacceptable for OLTP.
+Classic 2PC has one notorious flaw. If the coordinator dies between the two phases, the prepared shards are stuck **blocked** — holding their locks, unable to commit, unable to abort — until the coordinator wakes back up. For OLTP, that kind of stall is a non-starter.
 
-Aurora's twist is **time-aware, lead-shard 2PC**: it folds the timestamp scheme into 2PC so the protocol is **non-blocking**. One participating shard acts as the **lead shard** (coordinator role lives *with the data*, not in a separate fragile coordinator), and the shared `commitTs` from Time Sync gives every participant an unambiguous, recoverable commit point. A shard that loses contact can decide the outcome from durable state plus the timestamp, instead of blocking forever. (*Why not 3PC, or a Raft/Paxos-replicated coordinator like Spanner? — flagged here, contrasted in Pass 3.*)
+Aurora's twist is **time-aware, lead-shard 2PC**, which folds the timestamp scheme into 2PC to make the protocol **non-blocking**. Two ideas do the work. First, one of the participating shards plays **lead shard** — so the coordinator role lives *with the data*, not in a separate, fragile box that can vanish. Second, the shared `commitTs` from Time Sync gives every participant the same unambiguous commit point. Put those together and a shard that loses contact doesn't have to block: it can read its own durable state plus the agreed timestamp and work out the outcome by itself. (*Why not 3PC, or a Raft/Paxos-replicated coordinator like Spanner? — flagged here, contrasted in Pass 3.*)
 
 ```
 multi-shard write:
@@ -205,7 +205,7 @@ Here is the performance thesis, and it is worth tattooing on the inside of your 
 - **Read-only**: it only needs a `startTs`. It reads each shard with `commitTs <= startTs`. No prepare, no commit phase, no coordinator. Just a number and a comparison.
 - **Single-shard write**: everything lives on one shard, so that one shard commits locally — exactly like stock Postgres. No distributed protocol at all.
 
-Only **multi-shard writes** pay the 2PC cost. So the system is engineered so the *common* OLTP transaction (touching one customer, one shard) runs at near-single-node speed, and only the genuinely-distributed transaction pays for distribution.
+Only **multi-shard writes** pay the 2PC cost. So the whole system is tuned around one bet: the *common* OLTP transaction touches one customer on one shard, so let it run at near-single-node speed. Make only the genuinely-distributed transaction pay for distribution.
 
 ```
 transaction type            distributed protocol?    cost

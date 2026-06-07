@@ -74,7 +74,7 @@ Before anything can scale, we need a *unit* to scale in, and a starting size. Bo
 
 > **ACU (Aurora Capacity Unit):** the granular unit of capacity Serverless bills and scales in. **One ACU ≈ 2 GB of memory**, plus a *proportional* slice of CPU and network bandwidth.
 
-Why 2 GB as the anchor? Because for a database engine, **memory is the binding resource** — it's what holds the buffer cache (cached data pages) and the per-connection working memory. CPU and network are sized to match that memory so an ACU is a *balanced* bundle, not a lopsided one. So "10 ACUs" means roughly 20 GB of memory with CPU/network to match. (The 2 GB figure is the published Aurora Serverless V2 anchor; treat the CPU/network ratios as "proportional, exact ratio not load-bearing here.")
+Why anchor on memory, of all things? Because for a database engine, memory is what runs out first. It holds the buffer cache (the data pages kept in RAM) and the per-connection working memory — starve it and everything stalls. So Aurora pegs the unit to the binding resource and sizes CPU and network to match. An ACU is a *balanced* bundle, not a lopsided one. "10 ACUs" then means roughly 20 GB of memory with CPU/network to match. (The 2 GB figure is the published Aurora Serverless V2 anchor; treat the CPU/network ratios as "proportional, exact ratio not load-bearing here.")
 
 > **Serverless V2** is the Aurora feature that scales a *single* Postgres node's capacity up and down in fine ACU steps, in place, without a restart. Limitless uses it as the per-node vertical-scaling primitive (Rung 3). For now: a node can smoothly become bigger or smaller, measured in ACUs.
 
@@ -91,7 +91,7 @@ That's the entire capacity contract. Everything else — how many routers, how m
 
 ### From max budget to initial node counts: the Table-1 lookup
 
-The pain this solves: a brand-new shard group needs a *starting* number of routers and shards before any load history exists. Aurora derives it from **shardGroupMaxACU** via a fixed lookup (the paper's Table 1). Four verified rows from that table — read them top-to-bottom and watch counts grow monotonically:
+Here's the pain. A brand-new shard group has zero load history — yet it still needs *some* starting number of routers and shards on day one. What can you size off when you know nothing about the traffic yet? The one thing the customer did tell you: their budget ceiling. So Aurora derives the starting topology from **shardGroupMaxACU** via a fixed lookup (the paper's Table 1). Four verified rows from that table — read them top-to-bottom and watch counts grow monotonically:
 
 ```
    total      initial      initial     default      max-ACU
@@ -134,7 +134,7 @@ With that settled: first, **4/8 is the common case** — the paper calls 4 route
 
 ## Rung 3 — Vertical scaling (§4.1): re-slicing the budget toward hot nodes
 
-Initial counts are set (Rung 2). Now the *bigger* axis. The pain: the budget must be split among the nodes, but load is **not** evenly distributed — one shard may be on fire while another idles. A static even split wastes the ceiling on cold nodes and starves the hot one.
+Initial counts are set (Rung 2). Now the *bigger* axis. Think of the budget as a fixed pie you have to cut among the nodes. If you cut even slices, you're betting every node works equally hard — but they never do. One shard is on fire while another idles. The even split hands the idle node a slice it'll never finish and leaves the busy one starving. That mismatch is the pain this rung fixes.
 
 ### Each node has its own min/max ACU band
 
@@ -181,7 +181,7 @@ Read it plainly: node `i`'s share of the total ceiling equals node `i`'s share o
 
 ### Why proportional, and why this is the *right* bet
 
-The rationale: **a hot node's demand grows fastest**, so it's the one most likely to slam into its ceiling next. Giving it the largest band means its Serverless V2 has room to keep scaling up *before* the next re-slice. A cold node, by contrast, will never use a big band, so handing it one just locks the headroom away from the node that needs it. Proportional allocation continuously aims the spare budget at wherever the heat is.
+Why bet the headroom on the busy node? Because a hot node's demand grows fastest — it's the one most likely to slam into its ceiling before the next re-slice comes around. Give it the largest band and its Serverless V2 still has room to climb. A cold node, meanwhile, will never touch a big band, so handing it one just locks the headroom away from the node that actually needs it. Proportional allocation does one thing, continuously: it aims the spare budget at wherever the heat is.
 
 > **Pre-empt:** *"Why not just give every node the full `shardGroupMaxACU` as its ceiling?"* Because then the per-node ceilings would sum to `N × shardGroupMaxACU` — every node could independently scale to the full budget and the group would blow past the customer's spend cap by N×. The bands must *partition* the budget. Proportional re-slicing is how you partition it intelligently instead of evenly.
 
@@ -221,7 +221,7 @@ The cost of being slow to grow is dropped requests (bad and immediate). The cost
 
 ## Rung 4 — Horizontal scaling: defining the table slice (§4.2)
 
-Vertical scaling has a hard wall: a node has a biggest size. Past that, the only move is **horizontal** — add a shard and move data onto it. But "move data" needs a *unit of movement*. Move whole shards' worth and you can't rebalance finely; track every row individually and the bookkeeping explodes. Pass 1 kept saying "slice" and deferring it — here it is.
+Vertical scaling hits a wall eventually: there's a biggest box, and once a node is it, you can't go bigger. The only move left is **horizontal** — add a shard and move data onto it. But "move data" begs a question: move it in chunks of *what size*? Move a whole shard's worth at a time and you can't rebalance with any finesse — it's all or nothing. Track and move every row on its own and the bookkeeping buries you. You want something in between. Pass 1 kept saying "slice" and promising to define it later. Here it is.
 
 ### The slice, defined
 
@@ -289,7 +289,7 @@ Corresponding slices of co-located tables move as one bundle, so the single-shar
 
 ## Rung 5 — The shard-split workflow (§4.2): the crown jewel
 
-Now the hard one. A shard is hot and even max vertical scaling can't save it. We must move some of its slices to a *new* shard. The naive way is a disaster; the real way is four phases, each solving the previous phase's pain.
+Now the hard one. Don't be put off — it looks gnarly, but each phase exists to clean up the mess the previous one left, so if you follow the chain it tells its own story. The setup: a shard is hot, max vertical scaling can't save it, and we have to move some of its slices to a *new* shard. The obvious way to do that is a disaster. The real way is four phases. Let's earn each one.
 
 ### The naive approach, and why it makes things worse
 
@@ -322,7 +322,7 @@ The whole design challenge is: **split a shard that has no spare capacity to giv
         a page is physically duplicated only WHEN one side writes it (copy-on-write)
 ```
 
-This is the key unlock: the clone is created **at the storage layer**, offloaded to the Aurora storage service, *not* driven by the source's Postgres compute. So the source's CPU/buffer-cache is barely touched — you can split a shard **even at max capacity**, because the heavy lifting happens below the compute tier. The new shard now has (a clone of) the source's data almost instantly, without a bulk read.
+Here's why this is the whole ballgame. The clone happens **at the storage layer** — the Aurora storage service does it, *not* the source's Postgres compute. Think of it like handing someone a copy of a shared document by pointing them at the same file rather than photocopying every page: nothing moves until somebody edits. So the source's CPU and buffer cache barely notice. That's what lets you split a shard **even at max capacity** — the heavy lifting happens below the tier that's drowning. The new shard has (a clone of) the source's data almost instantly, no bulk read.
 
 > **Pre-empt:** *"The source already runs 0–2 standbys (Pass 1). Why not just promote/fork one of those as the new shard — or stream the data over a logical replication slot — instead of cloning the volume?"* Two reasons. (1) A standby is a full warm copy of the **whole shard**, not the **subset of migrating slices**. Promoting it gives you a second copy of *everything*, then you'd *still* have to detach the slices you don't want — and worse, the fork still flows through **compute** (replay, promotion), which is the exact resource the hot source has none of. (2) A logical-replication slot streams row changes *through the source's compute and WAL decoder* — again loading the drowning node. The copy-on-write storage clone is **sub-compute** (it happens below the Postgres engine, in the storage service) and **near-instant** (it copies no pages up front). That combination — off-compute and immediate — is what neither the standby-promotion path nor the logical-slot path can offer.
 
@@ -343,7 +343,7 @@ This is the key unlock: the clone is created **at the storage layer**, offloaded
    new shard replays  [P → P+Δ]  to converge with the source.
 ```
 
-A **redo log** is the standard write-ahead record of every change (the same WAL concept Postgres/Aurora already maintain for durability). Replaying it is cheap and well-trodden. The new shard chases the source's tail. It can't catch up *completely* while the source still accepts writes — there's always a little more tail — which is exactly what Phase 3 freezes.
+A **redo log** is just the write-ahead record of every change — the same WAL that Postgres and Aurora already keep for durability, nothing new. Replaying it is cheap and well-trodden. So the new shard chases the source's tail, like a runner trying to lap up to someone still moving. And there's the catch: while the source keeps accepting writes, there's always a little more tail to chase. You can get *close* but never quite touch. Freezing that last gap is exactly Phase 3's job.
 
 ### Phase 3 — Switchover (the brief, the only impactful, window)
 
@@ -442,7 +442,7 @@ Whether you add a shard or a router, the new node needs ACUs — and the budget 
    if the budget is fully consumed              → the add is REJECTED (no spare to give).
 ```
 
-You can't conjure capacity. A horizontal add only succeeds if the budget has room; otherwise you must first raise `shardGroupMaxACU` (the only knob, Rung 2). This keeps horizontal and vertical scaling honest about the same single spend cap — they both draw from one budget.
+You can't conjure capacity out of nowhere. A horizontal add succeeds only if the budget has room to spare; if it doesn't, you raise `shardGroupMaxACU` first — that's the only knob (Rung 2). Notice what this enforces: horizontal and vertical scaling both drink from the *same* budget, so neither can quietly cheat the spend cap. One pie, two ways to cut it.
 
 > **The edge case — heat vs the spend cap.** This bites even **auto-splits** (Rung 5, system-initiated to relieve a hot shard). An auto-split needs a *new* shard, which needs ACUs from unconsumed budget. If the budget is **fully consumed**, there is no headroom — so the split **cannot proceed**, and the hot shard simply **stays hot**. The system does not silently overspend to cool it. `shardGroupMaxACU` is a **hard wall, by design — even against heat management**: the customer's spend cap outranks the system's own desire to relieve pressure. The only fix is for the customer to raise `shardGroupMaxACU`, which frees headroom and lets the pending split (and the relief it brings) finally run.
 

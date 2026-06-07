@@ -36,7 +36,7 @@ For a 1 TB warehouse ingest, **22 hours just for codec selection**. The actual c
 
 ### The pain
 
-Encoder cost scales with column-size × cascade-count. For a write-once-read-many workload that's not catastrophic — you only pay it once. But it makes ingest the bottleneck, not the queries. And for any column the data is *homogeneous within itself*: 1B timestamps are timestamps throughout. Trying DICT on a slice of them and trying DICT on a different slice will give nearly the same answer.
+Encoder cost scales with column-size × cascade-count. For a write-once-read-many workload that's not catastrophic — you only pay it once. But it makes ingest the bottleneck, not the queries. And here's the thing: a column is *homogeneous within itself*. A billion timestamps are timestamps all the way down. Try DICT on one slice of them, then try DICT on a slice from the other end — you'll get nearly the same answer. So why measure both? You're paying full freight to relearn what the first slice already told you.
 
 **The fix:** don't try every cascade on every byte. Sample.
 
@@ -106,7 +106,7 @@ After pruning, candidate set is typically **3–10 cascades** per column, not 80
 
 ### Why this is fine
 
-The pruning rules are conservative — they only drop cascades that the statistics *prove* are bad. Dropping DICT when distinct count is 50% of block size is not a guess; it's arithmetic. So pruning never costs compression.
+You might worry that pruning is gambling — drop the wrong cascade and you lose compression you'd never know about. It isn't. The rules only drop cascades the statistics *prove* are bad. When distinct count is 50% of block size, dropping DICT isn't a hunch; it's arithmetic — a dictionary with that many entries can't pay for itself. So pruning never costs compression. It only stops you from measuring what you already know.
 
 ### Real-world hook
 
@@ -131,9 +131,9 @@ One block of latency values:
 naive bit-width: 13 bits for ALL 100 values.
 ```
 
-The 1% outlier inflated the bit-width by 6 bits. Block size jumps from `100 × 7 = 700 bits` to `100 × 13 = 1300 bits` — 1.86× larger because of one row.
+That one outlier inflated the bit-width by 6 bits. Block size jumps from `100 × 7 = 700 bits` to `100 × 13 = 1300 bits` — 1.86× larger because of one row. One row taxes the other ninety-nine.
 
-This is the **single most damaging effect** in real-world bit-packing. Web latency, financial transactions, sensor data — all have rare big values that ruin naive width-fitting.
+This is the **single most damaging effect** in real-world bit-packing, and it's everywhere. Web latency has its timeouts, financial transactions have their whale orders, sensors have their glitch readings — every real column has rare big values, and naive width-fitting lets each one set the price for the whole block.
 
 ### The fix — patched bit-packing (PFOR)
 
@@ -188,7 +188,7 @@ The encoder detects this (the U-curve has no clear minimum) and **splits the cas
 
 ## Rung 5 — The cost model: it's not just bytes
 
-So far the encoder picks the cascade with the smallest encoded size. But pure size minimization can choose a cascade that *decodes slowly*, which is usually a bad trade for analytical workloads.
+So far the encoder picks the cascade with the smallest encoded size. Smallest wins — simple. But smallest on disk isn't free to read back. Squeeze the bytes too hard and you pick a cascade that *decodes slowly*, and for analytical workloads — where you read a column far more often than you write it — that's usually a bad trade. The cheapest file isn't the cheapest column.
 
 The cost model:
 
@@ -225,7 +225,7 @@ So a sample column that compresses 1.8× under FOR+bit-pack (2.5 ops/value) vs 2
 
 ### Pre-empt: "Doesn't this make the encoder hardware-specific?"
 
-Slightly. The encoder's β values change per CPU generation. But the *encoded bytes are still interpretable* (Pass 2 Rung 5) — any decoder reads them correctly. The cost model only affects which cascade is *chosen*, not how the resulting bytes are interpreted. An AVX-512 server can read bytes written by an ARM phone encoder; the chosen cascades might be suboptimal for the reader, but they still decode.
+Slightly — and it's worth being precise about what "slightly" buys you. The encoder's β values change per CPU generation. But the *encoded bytes are still interpretable* (Pass 2 Rung 5) — any decoder reads them correctly. Hardware-specific tuning and hardware-specific *bytes* are different things. The cost model only steers which cascade gets *chosen*; it never changes how the resulting bytes are read. An AVX-512 server can read bytes written by an ARM phone encoder; the chosen cascades might be suboptimal for the reader, but they still decode.
 
 ---
 

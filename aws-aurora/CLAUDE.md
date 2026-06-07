@@ -18,6 +18,15 @@ Section map (paper §-numbers): §2 Data Model · §3 Architecture (3.1 Aurora s
 - Has not used Aurora's storage internals; treat "Aurora storage replicates 6 ways across 3 AZs" as something to explain, not assume.
 - Prefers re-readable prose over compact prose. Flag every unexplained number (ACU, CEB, slice counts, NOPM figures).
 
+# Lab config
+
+(Read by `paper-practitioner` / `lab-reviewer`. Labs turn a pass's theory into a hands-on activity the learner runs locally.)
+
+- **Target stack:** stock PostgreSQL 16 in Docker (the learner has Docker + `psql` + `pgbench`). Aurora itself is not reproducible locally — labs **simulate** the relevant mechanic on stock Postgres (e.g. fake shards as separate Postgres containers/schemas, model time-based MVCC with explicit timestamp columns) rather than pretending to run Aurora.
+- **Runtime budget:** ≤ 45 minutes per lab, setup included. If a mechanic can't be felt in that window, scope to the single sharpest rung.
+- **Reproduce the pain locally.** Each lab makes the learner observe the stock-Postgres failure mode the pass describes (write ceiling, xid-snapshot cost, cross-shard atomicity gap) before showing how Aurora's design removes it. The learner can't run Aurora, but they *can* measure the wall Aurora was built to get past.
+- **Measurable success.** Prefer checks the learner reads off `pgbench`/`EXPLAIN`/a `SELECT`: a latency number, a row count, a visibility result against the `commitTs <= startTs` invariant.
+
 # Teaching rules
 
 (On top of the load-bearing rules baked into the pass-builder / pass-reviewer agents.)

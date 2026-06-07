@@ -52,7 +52,7 @@ order_id values:  1_000_000, 1_000_001, 1_000_002, ..., 1_000_499
                   └──── all > 1 million ────┘
 ```
 
-The first million doesn't carry any information — every value shares it. Subtract a **base value** (the minimum) and store the **offsets**.
+Think of a street where every house number starts with the same postal code — printing it on every envelope is wasted ink. The first million here is that postal code: every value shares it, so it carries no information. Subtract a **base value** (the minimum) and store just the **offsets** — the house numbers.
 
 ```
 base = 1_000_000
@@ -107,11 +107,11 @@ Original column: 60 bits per value. Delta column: 4 bits per value. **15× savin
 
 ### Decoding — and why this is harder than FOR
 
-To decode value `i`, you need value `i-1`. Which needs value `i-2`. Which needs… all the way back to `first_value`. **It's a chain.**
+FOR was easy: every value stood on its own, so you could reconstruct them in any order. DELTA isn't like that. To decode value `i`, you need value `i-1`. Which needs value `i-2`. Which needs… all the way back to `first_value`. **It's a chain.**
 
-Naive scalar decode: `decoded[i] = decoded[i-1] + delta[i]`. Serial. Slow.
+That sounds like bad news for SIMD — chains are serial, and SIMD wants independence. Naive scalar decode bears that out: `decoded[i] = decoded[i-1] + delta[i]`. Serial. Slow.
 
-SIMD decode uses a known trick called **prefix sum** (also called scan). It computes running totals in `log₂(N)` steps instead of `N`:
+But don't panic — this exact chain has a well-known parallel form. SIMD decode uses a trick called **prefix sum** (also called scan): the running total at each position, computed not one-at-a-time but in `log₂(N)` doubling steps instead of `N`:
 
 ```
 deltas:        [+1, +2, +5, +2, +3, +1, +4, +0]
@@ -162,7 +162,7 @@ Compression depends entirely on average run length. Run length 100 → 100× sav
 
 ### Decoding
 
-The output array is `expand each pair into `count` copies of `value``. This is **harder for SIMD** than FOR or DELTA — run lengths are irregular, so different slots are emitting different output sizes per iteration. The FastLanes paper handles this with a specialized RLE-aware decoder; we'll see the mechanics in Pass 2.
+The output array is `expand each pair into `count` copies of `value``. Why is this **harder for SIMD** than FOR or DELTA? Because run lengths are irregular: one pair might fill 100 slots, the next just 2, so every slot wants to emit a different output size in the same iteration — and SIMD likes everyone doing the same thing at once. The FastLanes paper handles this with a specialized RLE-aware decoder; we'll see the mechanics in Pass 2.
 
 ### Pain of RLE
 
@@ -211,7 +211,7 @@ encoded:               0,         1,        2,                0,         199, ..
 decoded[i] = dictionary[encoded[i]]
 ```
 
-This is a **gather** operation in SIMD: each slot uses its decoded ID as an index into the dictionary array and pulls the corresponding value. AVX2 and AVX-512 have dedicated `vgather` instructions for exactly this. One SIMD-gather decodes 8 values in parallel.
+Picture eight people each handed a page number, all walking to the same book and flipping to their page at once. That's a **gather** in SIMD: each slot uses its decoded ID as an index into the dictionary array and pulls the corresponding value. AVX2 and AVX-512 have dedicated `vgather` instructions for exactly this. One SIMD-gather decodes 8 values in parallel.
 
 ### Pain of DICT
 
@@ -223,7 +223,7 @@ DICT also leaves you with an **integer ID column** which still needs to be store
 
 ## Rung 6 — Cascading: chain the codecs
 
-Each codec exploits one kind of redundancy and produces a simpler column. Chain them.
+Here's the payoff. Each codec exploits one kind of redundancy and hands back a simpler column than it got. So why stop at one? Feed that simpler column into the next codec, which finds redundancy the first one left behind. Chain them.
 
 ### A worked example: timestamp_ns column
 

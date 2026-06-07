@@ -59,9 +59,9 @@ Eight integers up the wire instead of 800 million rows. That is the entire game 
 
 ## Rung 2 — How the router represents data it doesn't have: partitioned tables + FDW
 
-The router must *plan* a query over `orders` without holding a single order. The pain: a Postgres planner only knows how to plan over tables it can see locally. How do you make the stock planner reason about rows that live on eight other machines?
+So you push compute down. But to push it down, the router first has to *plan* a query over `orders` without holding a single order. Here's the snag: a Postgres planner only knows how to plan over tables it can see locally. So how do you make the stock planner reason about rows that live on eight other machines?
 
-AWS's answer is to **not write a new planner**. Instead they describe the distributed data using two mechanisms PostgreSQL *already has*, so the stock planner and executor "just work."
+You could write a whole new distributed planner. AWS didn't. Instead they describe the distributed data using two mechanisms PostgreSQL *already has*, dressing the remote layout up in clothes the stock planner already recognizes — so the planner and executor "just work."
 
 ### Mechanism (a): a sharded table is a Postgres *partitioned table*
 
@@ -77,7 +77,7 @@ On the router, `orders` is modeled as a **partitioned table** — Postgres's nat
         └── orders_p7   → hash range owned by shard 7
 ```
 
-Now the planner sees a perfectly ordinary partitioned table and applies all its mature partitioned-table machinery (Rung 6's partition pruning, Rung 5's partition-wise joins) for free.
+From the planner's chair, this looks like a perfectly ordinary partitioned table — so it reaches for all its mature partitioned-table machinery (Rung 6's partition pruning, Rung 5's partition-wise joins) without anyone teaching it a thing. You get that for free.
 
 ### Mechanism (b): each partition is a *foreign table* via a custom FDW
 
@@ -133,9 +133,9 @@ Same Postgres feature (partitioning), used at two scales for two jobs. Router-si
 
 ## Rung 3 — Aggregation pushdown: split the work into "partial" and "finalize"
 
-Rung 1 showed *why* we push `count(*)` down; Rung 2 gave the router a way to *plan* over remote data. Now watch the planner actually do it, because the shape of the plan is reused everywhere below.
+Rung 1 showed *why* we push `count(*)` down; Rung 2 gave the router a way to *plan* over remote data. Now watch the planner actually do it. Watch this one closely — its shape is reused in every rung below.
 
-The pain a naive count still has even with FDW: if the FDW just fetched all rows and the router counted, we're back to Rung 1's flood. The planner must *split* the aggregate.
+Here's a trap the FDW doesn't save you from on its own: if the FDW just fetched all rows and the router counted, we're right back in Rung 1's flood. So the planner has to be cleverer. It has to *split* the aggregate in two.
 
 > **Partial aggregation:** Postgres can break an aggregate into two stages — a **partial** stage that each data source computes locally over its own rows, and a **finalize** stage that combines the partials. For `count(*)`, the partial is "count my rows" and the finalize is "sum the partial counts." (For `avg`, the partial is `(sum, count)` and finalize divides — same idea, slightly richer partial.)
 
@@ -175,7 +175,7 @@ The principle: **do as much reduction (count, sum, group, sort, limit) at the sh
 
 ## Rung 4 — Predicate pushdown: which `WHERE` clauses are safe to run on a shard?
 
-Aggregates push down (Rung 3). The next obvious win is **filters**: don't ship rows the query will throw away — apply the `WHERE` at the shard and ship only survivors. But here's the catch §7 forces us to confront: **not every predicate is safe to run on a shard.** The router must *classify* each predicate first.
+Aggregates push down (Rung 3). The next obvious win is **filters**: why ship a row only to throw it away at the router? Apply the `WHERE` at the shard and ship only the survivors. Simple enough — except §7 forces a catch on us: **not every predicate is safe to run on a shard.** So before pushing anything, the router has to *classify* each predicate.
 
 > **Foreign predicate:** a predicate the router judges safe to execute *at the shard* (push it down). **Local predicate:** a predicate that must be evaluated *at the router*, which forces the matching rows to be pulled up first.
 

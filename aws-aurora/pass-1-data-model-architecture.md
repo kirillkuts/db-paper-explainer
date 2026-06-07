@@ -34,7 +34,7 @@ app code, on every single query, must compute:
 
 ## Rung 2 — Three table types: telling the system what data goes where
 
-The app can't route transparently unless the system knows the *shape* of each table's access pattern. Aurora gives you exactly three table types. We'll build them on the paper's Figure 1 toy schema:
+Think of it like a post office that has to deliver without you writing the route on each envelope. It can only do that if it knows what *kind* of mail each thing is. Same here: the app can't route transparently unless the system knows the *shape* of each table's access pattern. So Aurora gives you exactly three table types. We'll build them on the paper's Figure 1 toy schema:
 
 ```
 customers (cust_id PK, name, region)          ← big, per-customer, the natural shard axis
@@ -44,7 +44,7 @@ tax_rates (region PK, rate)                    ← tiny, rarely changes, joined 
 
 ### Type A — Sharded table: hash-partitioned on a key *you* choose
 
-A **sharded table** is split across all shards by hashing a column you nominate, the **shard key**. This is the type that actually buys you horizontal scale (big tables spread their rows + write load across shards).
+A **sharded table** is split across all shards by hashing a column you nominate — the **shard key** (the column whose value decides which box a row lives on). This is the type that actually buys you horizontal scale. Big tables spread their rows and their write load across every shard.
 
 ```sql
 SET limitless_create_table_mode = 'sharded';
@@ -61,7 +61,7 @@ production hash, not mod — this is just so you can verify the placement):
    cust_id=9  → 9 mod 4 = 1 → shard 1      cust_id=88 → 88 mod 4 = 0 → shard 0
 ```
 
-Why **hash** partitioning and not **range** (e.g. cust_id 1–1000 on shard 0)? Range partitioning creates hotspots: the newest customers (highest ids) all land on the last shard, so the shard taking all the fresh inserts becomes a bottleneck. Hashing spreads inserts evenly by construction. (Range has its uses for ordered scans; OLTP's many-small-writes profile prefers the even spread.)
+Why **hash** partitioning and not **range** (e.g. cust_id 1–1000 on shard 0)? Picture range partitioning for a second. The newest customers all have the highest ids, so they all land on the last shard. That shard now eats every fresh insert while the others sit idle — a hotspot. Hashing scrambles the ids, so inserts spread evenly by construction. (Range has its uses for ordered scans; OLTP's many-small-writes profile prefers the even spread.)
 
 ### Type B — Reference table: one full copy on *every* shard
 
@@ -83,7 +83,7 @@ Now any shard can join orders→tax_rates **locally**, no cross-shard hop. The c
 
 ### Type C — Standard table: lives on one shard, the easy on-ramp
 
-A **standard table** isn't distributed at all — it sits whole on a single shard, behaving exactly like a stock-Postgres table.
+A **standard table** isn't distributed at all. It sits whole on a single shard and behaves exactly like a stock-Postgres table.
 
 ```sql
 SET limitless_create_table_mode = 'standard';
@@ -122,7 +122,7 @@ This is the data-model lever for the **single-shard sweet spot** from Pass 0 Run
 
 ## Rung 3 — Who actually holds what: the router/shard role split, in detail
 
-Pass 0 sketched routers vs shards. Now the precise division of labor, because the *metadata* placement is what makes transparent routing work.
+Pass 0 sketched routers vs shards. Now let's pin down exactly who does what — because where the *metadata* lives is the thing that makes transparent routing work at all.
 
 ```
         app  ── one DNS endpoint ──┐
@@ -154,7 +154,7 @@ Pass 0 sketched routers vs shards. Now the precise division of labor, because th
 - **Schema** — every table's type and shard key, so the router knows how to route a given SQL statement.
 - **Placement map** — which key ranges (we'll call the unit a *slice*, deepened in Pass 4) live on which shard. This is the lookup that replaces your app's `hash(cust_id) % 4`. The router computes the hash, consults the map, and sends the fragment to the right shard.
 
-This is why routers are the authoritative metadata holders: routing transparently *is* knowing the placement map, and the app must hit a router that knows it. Shards don't need the global map — each just owns its own slice.
+So why are the routers the authoritative metadata holders, and not the shards? Because routing transparently *is* knowing the placement map. Whoever the app talks to has to know it. Shards don't — each just owns its own slice and answers for that.
 
 The whole set — routers + shards — is the **shard group** (vocabulary from Pass 0).
 
